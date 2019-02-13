@@ -42,6 +42,7 @@
 #include "put_bits.h"
 
 #define DEFAULT_TRANSPARENCY_INDEX 0x1f
+#define abs(x) (((x)<0) ? -(x) : (x))
 
 typedef struct GIFContext {
     const AVClass *class;
@@ -54,6 +55,8 @@ typedef struct GIFContext {
     uint32_t palette[AVPALETTE_COUNT];  ///< local reference palette for !pal8
     int palette_loaded;
     int transparent_index;
+    int transdiff_color_mode;
+    int transdiff_fuzziness;
     uint8_t *tmpl;                      ///< temporary line buffer
 } GIFContext;
 
@@ -264,7 +267,7 @@ static int gif_image_write_image(AVCodecContext *avctx,
     GIFContext *s = avctx->priv_data;
     int disposal, len = 0, height = avctx->height, width = avctx->width, x, y;
     int x_start = 0, y_start = 0, trans = s->transparent_index;
-    int bcid = -1, honor_transparency = (s->flags & GF_TRANSDIFF) && s->last_frame && !palette;
+    int bcid = -1, honor_transparency = (s->flags & GF_TRANSDIFF) && s->last_frame;
     const uint8_t *ptr;
 
     if (!s->image && avctx->frame_number && is_image_translucent(avctx, buf, linesize)) {
@@ -351,14 +354,55 @@ static int gif_image_write_image(AVCodecContext *avctx,
         const int ref_linesize = s->last_frame->linesize[0];
         const uint8_t *ref = s->last_frame->data[0] + y_start*ref_linesize + x_start;
 
-        for (y = 0; y < height; y++) {
-            memcpy(s->tmpl, ptr, width);
-            for (x = 0; x < width; x++)
-                if (ref[x] == ptr[x])
-                    s->tmpl[x] = trans;
-            len += ff_lzw_encode(s->lzw, s->tmpl, width);
-            ptr += linesize;
-            ref += ref_linesize;
+        if(s->transdiff_color_mode == 0) {
+            for (y = 0; y < height; y++) {
+                memcpy(s->tmpl, ptr, width);
+                for (x = 0; x < width; x++)
+                    if (abs(ref[x] - ptr[x]) <= s->transdiff_fuzziness)
+                        s->tmpl[x] = trans;
+                len += ff_lzw_encode(s->lzw, s->tmpl, width);
+                ptr += linesize;
+                ref += ref_linesize;
+            }
+        } else if(palette && s->last_frame->data[1]) {
+            if(s->transdiff_fuzziness == 0) {
+                const uint32_t* previousPalette = s->last_frame->data[1];
+                const uint32_t* currentPalette = palette;
+                for (y = 0; y < height; y++) {
+                    memcpy(s->tmpl, ptr, width);
+                    for (x = 0; x < width; x++) {
+                        if (previousPalette[ref[x]] == currentPalette[ptr[x]])
+                            s->tmpl[x] = trans;
+                    }
+                    len += ff_lzw_encode(s->lzw, s->tmpl, width);
+                    ptr += linesize;
+                    ref += ref_linesize;
+                }
+            } else {
+                const uint8_t* previousPalette = s->last_frame->data[1];
+                const uint8_t* currentPalette = palette;
+                for (y = 0; y < height; y++) {
+                    memcpy(s->tmpl, ptr, width);
+                    for (x = 0; x < width; x++) {
+                        int offset0 = abs(previousPalette[ref[x]] - currentPalette[ptr[x]]);
+                        int offset1 = abs(previousPalette[ref[x] + 1] - currentPalette[ptr[x] + 1]);
+                        int offset2 = abs(previousPalette[ref[x] + 2] - currentPalette[ptr[x] + 2]);
+                        int offset3 = abs(previousPalette[ref[x] + 3] - currentPalette[ptr[x] + 3]);
+                        if (offset0 <= s->transdiff_fuzziness && offset1 <= s->transdiff_fuzziness &&
+                            offset2 <= s->transdiff_fuzziness && offset3 <= s->transdiff_fuzziness) {
+                            s->tmpl[x] = trans;
+                        }
+                    }
+                    len += ff_lzw_encode(s->lzw, s->tmpl, width);
+                    ptr += linesize;
+                    ref += ref_linesize;
+                }
+            }
+        } else {
+            for (y = 0; y < height; y++) {
+                len += ff_lzw_encode(s->lzw, ptr, width);
+                ptr += linesize;
+            }
         }
     } else {
         for (y = 0; y < height; y++) {
