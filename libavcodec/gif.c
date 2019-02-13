@@ -39,6 +39,9 @@
 
 #include "put_bits.h"
 
+#define DEFAULT_TRANSPARENCY_INDEX 0x1f
+#define abs(x) (((x)<0) ? -(x) : (x))
+
 typedef struct GIFContext {
     const AVClass *class;
     LZWState *lzw;
@@ -50,6 +53,8 @@ typedef struct GIFContext {
     int palette_loaded;
     int transparent_index;
     uint8_t *pal_exdata;
+    int transdiff_color_mode;
+    int transdiff_fuzziness;
     uint8_t *tmpl;                      ///< temporary line buffer
 } GIFContext;
 
@@ -137,6 +142,74 @@ static int gif_image_write_image(AVCodecContext *avctx,
                width, height, x_start, y_start, avctx->width, avctx->height);
     }
 
+static int gif_image_write_image(AVCodecContext *avctx,
+                                 uint8_t **bytestream, uint8_t *end,
+                                 const uint32_t *palette,
+                                 const uint8_t *buf, const int linesize,
+                                 AVPacket *pkt)
+{
+    GIFContext *s = avctx->priv_data;
+    int disposal, len = 0, height = avctx->height, width = avctx->width, x, y;
+    int x_start = 0, y_start = 0, trans = s->transparent_index;
+    int bcid = -1, honor_transparency = (s->flags & GF_TRANSDIFF) && s->last_frame;
+    const uint8_t *ptr;
+
+    if (!s->image && avctx->frame_number && is_image_translucent(avctx, buf, linesize)) {
+        gif_crop_translucent(avctx, buf, linesize, &width, &height, &x_start, &y_start);
+        honor_transparency = 0;
+        disposal = GCE_DISPOSAL_BACKGROUND;
+    } else {
+        gif_crop_opaque(avctx, palette, buf, linesize, &width, &height, &x_start, &y_start);
+        disposal = GCE_DISPOSAL_INPLACE;
+    }
+
+    if (s->image || !avctx->frame_number) { /* GIF header */
+        const uint32_t *global_palette = palette ? palette : s->palette;
+        const AVRational sar = avctx->sample_aspect_ratio;
+        int64_t aspect = 0;
+
+        if (sar.num > 0 && sar.den > 0) {
+            aspect = sar.num * 64LL / sar.den - 15;
+            if (aspect < 0 || aspect > 255)
+                aspect = 0;
+        }
+
+        bytestream_put_buffer(bytestream, gif89a_sig, sizeof(gif89a_sig));
+        bytestream_put_le16(bytestream, avctx->width);
+        bytestream_put_le16(bytestream, avctx->height);
+
+        bcid = get_palette_transparency_index(global_palette);
+
+        bytestream_put_byte(bytestream, 0xf7); /* flags: global clut, 256 entries */
+        bytestream_put_byte(bytestream, bcid < 0 ? DEFAULT_TRANSPARENCY_INDEX : bcid); /* background color index */
+        bytestream_put_byte(bytestream, aspect);
+        for (int i = 0; i < 256; i++) {
+            const uint32_t v = global_palette[i] & 0xffffff;
+            bytestream_put_be24(bytestream, v);
+        }
+    }
+
+    if (honor_transparency && trans < 0) {
+        trans = pick_palette_entry(buf + y_start*linesize + x_start,
+                                   linesize, width, height);
+        if (trans < 0) // TODO, patch welcome
+            av_log(avctx, AV_LOG_DEBUG, "No available color, can not use transparency\n");
+    }
+
+    if (trans < 0)
+        honor_transparency = 0;
+
+    bcid = honor_transparency || disposal == GCE_DISPOSAL_BACKGROUND ? trans : get_palette_transparency_index(palette);
+
+    /* graphic control extension */
+    bytestream_put_byte(bytestream, GIF_EXTENSION_INTRODUCER);
+    bytestream_put_byte(bytestream, GIF_GCE_EXT_LABEL);
+    bytestream_put_byte(bytestream, 0x04); /* block size */
+    bytestream_put_byte(bytestream, disposal<<2 | (bcid >= 0));
+    bytestream_put_le16(bytestream, 5); // default delay
+    bytestream_put_byte(bytestream, bcid < 0 ? DEFAULT_TRANSPARENCY_INDEX : bcid);
+    bytestream_put_byte(bytestream, 0x00);
+
     /* image block */
     bytestream_put_byte(bytestream, GIF_IMAGE_SEPARATOR);
     bytestream_put_le16(bytestream, x_start);
@@ -183,14 +256,55 @@ static int gif_image_write_image(AVCodecContext *avctx,
         const int ref_linesize = s->last_frame->linesize[0];
         const uint8_t *ref = s->last_frame->data[0] + y_start*ref_linesize + x_start;
 
-        for (y = 0; y < height; y++) {
-            memcpy(s->tmpl, ptr, width);
-            for (x = 0; x < width; x++)
-                if (ref[x] == ptr[x])
-                    s->tmpl[x] = trans;
-            len += ff_lzw_encode(s->lzw, s->tmpl, width);
-            ptr += linesize;
-            ref += ref_linesize;
+        if(s->transdiff_color_mode == 0) {
+            for (y = 0; y < height; y++) {
+                memcpy(s->tmpl, ptr, width);
+                for (x = 0; x < width; x++)
+                    if (abs(ref[x] - ptr[x]) <= s->transdiff_fuzziness)
+                        s->tmpl[x] = trans;
+                len += ff_lzw_encode(s->lzw, s->tmpl, width);
+                ptr += linesize;
+                ref += ref_linesize;
+            }
+        } else if(palette && s->last_frame->data[1]) {
+            if(s->transdiff_fuzziness == 0) {
+                const uint32_t* previousPalette = s->last_frame->data[1];
+                const uint32_t* currentPalette = palette;
+                for (y = 0; y < height; y++) {
+                    memcpy(s->tmpl, ptr, width);
+                    for (x = 0; x < width; x++) {
+                        if (previousPalette[ref[x]] == currentPalette[ptr[x]])
+                            s->tmpl[x] = trans;
+                    }
+                    len += ff_lzw_encode(s->lzw, s->tmpl, width);
+                    ptr += linesize;
+                    ref += ref_linesize;
+                }
+            } else {
+                const uint8_t* previousPalette = s->last_frame->data[1];
+                const uint8_t* currentPalette = palette;
+                for (y = 0; y < height; y++) {
+                    memcpy(s->tmpl, ptr, width);
+                    for (x = 0; x < width; x++) {
+                        int offset0 = abs(previousPalette[ref[x]] - currentPalette[ptr[x]]);
+                        int offset1 = abs(previousPalette[ref[x] + 1] - currentPalette[ptr[x] + 1]);
+                        int offset2 = abs(previousPalette[ref[x] + 2] - currentPalette[ptr[x] + 2]);
+                        int offset3 = abs(previousPalette[ref[x] + 3] - currentPalette[ptr[x] + 3]);
+                        if (offset0 <= s->transdiff_fuzziness && offset1 <= s->transdiff_fuzziness &&
+                            offset2 <= s->transdiff_fuzziness && offset3 <= s->transdiff_fuzziness) {
+                            s->tmpl[x] = trans;
+                        }
+                    }
+                    len += ff_lzw_encode(s->lzw, s->tmpl, width);
+                    ptr += linesize;
+                    ref += ref_linesize;
+                }
+            }
+        } else {
+            for (y = 0; y < height; y++) {
+                len += ff_lzw_encode(s->lzw, ptr, width);
+                ptr += linesize;
+            }
         }
     } else {
         for (y = 0; y < height; y++) {

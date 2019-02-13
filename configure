@@ -5046,7 +5046,9 @@ test_cflags_cc -std=c11 ctype.h "__STDC_VERSION__ >= 201112L" &&
     add_cflags -std=c11 ||
     check_cflags -std=c99
 
-check_cppflags -D_FILE_OFFSET_BITS=64
+if [ $target_os != "android" ]; then
+    check_cppflags -D_FILE_OFFSET_BITS=64
+fi
 check_cppflags -D_LARGEFILE_SOURCE
 
 add_host_cppflags -D_ISOC99_SOURCE
