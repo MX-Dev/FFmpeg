@@ -38,7 +38,7 @@ typedef struct ProSumerContext {
 
     unsigned stride;
     unsigned size;
-    uint32_t lut[0x2000];
+    uint32_t lut[0x10000];
     uint8_t *initial_line;
     uint8_t *decbuffer;
 } ProSumerContext;
@@ -84,13 +84,16 @@ static int decompress(GetByteContext *gb, int size, PutByteContext *pb, const ui
                     if (bytestream2_get_bytes_left(gb) <= 0) {
                         if (!a)
                             return 0;
+                        cnt = 4;
                     } else {
-                        pos = bytestream2_tell(gb);
-                        bytestream2_seek(gb, pos ^ 2, SEEK_SET);
+                        pos = bytestream2_tell(gb) ^ 2;
+                        bytestream2_seek(gb, pos, SEEK_SET);
                         AV_WN16(&a, bytestream2_peek_le16(gb));
-                        bytestream2_seek(gb, pos + 2, SEEK_SET);
+                        pos = pos ^ 2;
+                        bytestream2_seek(gb, pos, SEEK_SET);
+                        bytestream2_skip(gb, 2);
+                        cnt = 4;
                     }
-                    cnt = 4;
                 }
                 c--;
             }
@@ -116,10 +119,12 @@ static int decompress(GetByteContext *gb, int size, PutByteContext *pb, const ui
                 }
                 return 0;
             }
-            pos = bytestream2_tell(gb);
-            bytestream2_seek(gb, pos ^ 2, SEEK_SET);
+            pos = bytestream2_tell(gb) ^ 2;
+            bytestream2_seek(gb, pos, SEEK_SET);
             AV_WN16(&a, bytestream2_peek_le16(gb));
-            bytestream2_seek(gb, pos + 2, SEEK_SET);
+            pos = pos ^ 2;
+            bytestream2_seek(gb, pos, SEEK_SET);
+            bytestream2_skip(gb, 2);
             cnt = 4;
             idx--;
         }
@@ -159,8 +164,6 @@ static int decode_frame(AVCodecContext *avctx, void *data,
     ret = decompress(&s->gb, AV_RL32(avpkt->data + 28) >> 1, &s->pb, s->lut);
     if (ret < 0)
         return ret;
-    if (bytestream2_get_bytes_left_p(&s->pb) > s->size * (int64_t)avctx->discard_damaged_percentage / 100)
-        return AVERROR_INVALIDDATA;
     vertical_predict((uint32_t *)s->decbuffer, 0, (uint32_t *)s->initial_line, s->stride, 1);
     vertical_predict((uint32_t *)s->decbuffer, s->stride, (uint32_t *)s->decbuffer, s->stride, avctx->height - 1);
 

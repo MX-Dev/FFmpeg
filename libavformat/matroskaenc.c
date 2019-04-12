@@ -693,7 +693,7 @@ static int put_flac_codecpriv(AVFormatContext *s,
         snprintf(buf, sizeof(buf), "0x%"PRIx64, par->channel_layout);
         av_dict_set(&dict, "WAVEFORMATEXTENSIBLE_CHANNEL_MASK", buf, 0);
 
-        len = ff_vorbiscomment_length(dict, vendor, NULL, 0);
+        len = ff_vorbiscomment_length(dict, vendor);
         if (len >= ((1<<24) - 4)) {
             av_dict_free(&dict);
             return AVERROR(EINVAL);
@@ -709,7 +709,7 @@ static int put_flac_codecpriv(AVFormatContext *s,
         AV_WB24(data + 1, len);
 
         p = data + 4;
-        ff_vorbiscomment_write(&p, &dict, vendor, NULL, 0);
+        ff_vorbiscomment_write(&p, &dict, vendor);
 
         avio_write(pb, data, len + 4);
 
@@ -2536,8 +2536,7 @@ static int mkv_write_packet(AVFormatContext *s, AVPacket *pkt)
     // buffer an audio packet to ensure the packet containing the video
     // keyframe's timecode is contained in the same cluster for WebM
     if (codec_type == AVMEDIA_TYPE_AUDIO) {
-        if (pkt->size > 0)
-            ret = av_packet_ref(&mkv->cur_audio_pkt, pkt);
+        ret = av_packet_ref(&mkv->cur_audio_pkt, pkt);
     } else
         ret = mkv_write_packet_internal(s, pkt, 0);
     return ret;
@@ -2784,7 +2783,6 @@ static const AVCodecTag additional_video_tags[] = {
 
 static const AVCodecTag additional_subtitle_tags[] = {
     { AV_CODEC_ID_DVB_SUBTITLE,      0xFFFFFFFF },
-    { AV_CODEC_ID_DVD_SUBTITLE,      0xFFFFFFFF },
     { AV_CODEC_ID_HDMV_PGS_SUBTITLE, 0xFFFFFFFF },
     { AV_CODEC_ID_NONE,              0xFFFFFFFF }
 };
